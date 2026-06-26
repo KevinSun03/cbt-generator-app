@@ -9,9 +9,9 @@ import streamlit as st
 from cbt_generator import generate_cbt_file
 
 
-st.set_page_config(page_title="Daily CBT Generator", page_icon="📋", layout="centered")
+st.set_page_config(page_title="Daily LAXCBT Attendance Generator", page_icon="📋", layout="centered")
 
-st.title("Daily CBT Generator")
+st.title("Daily LAXCBT Attendance Generator")
 st.caption("Upload NOVA, Newstart, and HRN spreadsheets, then export one CBT workbook with consistent formatting.")
 
 with st.form("cbt_form"):
