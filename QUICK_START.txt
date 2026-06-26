@@ -1,0 +1,19 @@
+Daily CBT Generator - Quick Start
+
+1. Open Terminal.
+2. Go to this folder:
+   cd /path/to/cbt_generator_app
+
+3. Install and run:
+   python3 -m pip install -r requirements.txt
+   python3 -m streamlit run app.py
+
+4. In the browser:
+   - Pick the CBT date
+   - Upload NOVA spreadsheet
+   - Upload Newstart spreadsheet
+   - Upload HRN spreadsheet
+   - Click Generate CBT Excel
+   - Download cbt_MMDD.xlsx
+
+Newstart automatically uses TT only.
