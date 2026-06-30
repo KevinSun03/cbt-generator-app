@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 import tempfile
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
 from cbt_generator import generate_cbt_file
+
+
+LA_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def today_la():
+    return datetime.now(LA_TZ).date()
 
 
 st.set_page_config(page_title="Daily CBT Generator", page_icon="📋", layout="centered")
@@ -18,7 +26,7 @@ st.caption(
 )
 
 with st.form("cbt_form"):
-    work_date = st.date_input("CBT date", value=date.today())
+    work_date = st.date_input("CBT date", value=today_la())
 
     st.subheader("Companies to include")
     st.caption("Uncheck a company when that company did not work or you do not have that spreadsheet.")
