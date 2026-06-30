@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -175,7 +176,7 @@ NEWSTART_NOTE_MAP = {
     "杨俊杰": "签到管理",
     "王竹龙": "晚班叉车",
     "杨先忠": "晚班叉车",
-    "彭宇": "收发货",
+    "彭宇": "",
     "李少龙": "晚班叉车",
     "周斌": "早班叉车",
     "谢庆伟": "晚班叉车",
@@ -350,20 +351,24 @@ def _mmdd(d: date) -> str:
 
 
 def build_cbt_workbook(
-    nova_rows: Sequence[AttendanceRow],
-    newstart_rows: Sequence[AttendanceRow],
-    hrn_rows: Sequence[AttendanceRow],
+    company_rows: Sequence[tuple[str, Sequence[AttendanceRow]]],
     work_date: date,
 ) -> Workbook:
+    """Build a CBT workbook using only the companies provided.
+
+    Example company_rows:
+        [("NOVA", nova_rows), ("HRN", hrn_rows)]
+
+    This allows days where only one or two companies worked.
+    """
+    if not company_rows:
+        raise ValueError("No company data was provided. Select/upload at least one spreadsheet.")
+
     wb = Workbook()
     # Remove default sheet.
     wb.remove(wb.active)
 
-    for company, rows in [
-        ("NOVA", nova_rows),
-        ("Newstart", newstart_rows),
-        ("HRN", hrn_rows),
-    ]:
+    for company, rows in company_rows:
         ws = wb.create_sheet(f"{company}_{_mmdd(work_date)}")
         write_cbt_sheet(ws, rows, company, work_date)
 
@@ -441,38 +446,53 @@ def write_cbt_sheet(ws, rows: Sequence[AttendanceRow], company: str, work_date: 
 
 
 def generate_cbt_file(
-    nova_path: str | Path,
-    newstart_path: str | Path,
-    hrn_path: str | Path,
+    nova_path: str | Path | None,
+    newstart_path: str | Path | None,
+    hrn_path: str | Path | None,
     output_path: str | Path,
     work_date: date | None = None,
     newstart_tt_only: bool = True,
 ) -> dict:
-    nova_wb = load_workbook(nova_path, data_only=True)
-    newstart_wb = load_workbook(newstart_path, data_only=True)
-    hrn_wb = load_workbook(hrn_path, data_only=True)
+    """Generate a CBT workbook from any available company spreadsheets.
+
+    Pass None for a company path when that company should be skipped for the day.
+    Only the provided companies will become sheets in the final workbook.
+    """
+    if nova_path is None and newstart_path is None and hrn_path is None:
+        raise ValueError("No spreadsheets were provided. Upload at least one company spreadsheet.")
+
+    nova_wb = load_workbook(nova_path, data_only=True) if nova_path is not None else None
+    newstart_wb = load_workbook(newstart_path, data_only=True) if newstart_path is not None else None
+    hrn_wb = load_workbook(hrn_path, data_only=True) if hrn_path is not None else None
 
     if work_date is None:
-        work_date = (
-            extract_date_from_workbook(nova_wb)
-            or extract_date_from_workbook(newstart_wb)
-            or extract_date_from_workbook(hrn_wb)
-            or date.today()
-        )
+        workbook_candidates = [wb for wb in [nova_wb, newstart_wb, hrn_wb] if wb is not None]
+        work_date = next((extract_date_from_workbook(wb) for wb in workbook_candidates if extract_date_from_workbook(wb)), None) or date.today()
 
-    nova_rows = parse_nova(nova_wb)
-    newstart_rows = parse_newstart(newstart_wb, tt_only=newstart_tt_only)
-    hrn_rows = parse_hrn(hrn_wb, target_date=work_date)
+    company_rows: list[tuple[str, list[AttendanceRow]]] = []
+    counts: dict[str, int] = {}
 
-    out_wb = build_cbt_workbook(nova_rows, newstart_rows, hrn_rows, work_date)
+    if nova_wb is not None:
+        nova_rows = parse_nova(nova_wb)
+        company_rows.append(("NOVA", nova_rows))
+        counts["NOVA"] = len(nova_rows)
+
+    if newstart_wb is not None:
+        newstart_rows = parse_newstart(newstart_wb, tt_only=newstart_tt_only)
+        company_rows.append(("Newstart", newstart_rows))
+        counts["Newstart"] = len(newstart_rows)
+
+    if hrn_wb is not None:
+        hrn_rows = parse_hrn(hrn_wb, target_date=work_date)
+        company_rows.append(("HRN", hrn_rows))
+        counts["HRN"] = len(hrn_rows)
+
+    out_wb = build_cbt_workbook(company_rows, work_date)
     out_wb.save(output_path)
 
     return {
         "output_path": str(output_path),
         "date": work_date.isoformat(),
-        "counts": {
-            "NOVA": len(nova_rows),
-            "Newstart": len(newstart_rows),
-            "HRN": len(hrn_rows),
-        },
+        "counts": counts,
+        "sheets": [f"{company}_{_mmdd(work_date)}" for company, _ in company_rows],
     }
