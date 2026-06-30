@@ -11,8 +11,13 @@ from typing import Iterable, Optional, Sequence
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
+from zoneinfo import ZoneInfo
+LA_TZ = ZoneInfo("America/Los_Angeles")
 
 
+def today_la() -> date:
+    return datetime.now(LA_TZ).date()
+    
 @dataclass
 class AttendanceRow:
     name: str
@@ -467,7 +472,7 @@ def generate_cbt_file(
 
     if work_date is None:
         workbook_candidates = [wb for wb in [nova_wb, newstart_wb, hrn_wb] if wb is not None]
-        work_date = next((extract_date_from_workbook(wb) for wb in workbook_candidates if extract_date_from_workbook(wb)), None) or date.today()
+        work_date = next((extract_date_from_workbook(wb) for wb in workbook_candidates if extract_date_from_workbook(wb)), None) or today_la()
 
     company_rows: list[tuple[str, list[AttendanceRow]]] = []
     counts: dict[str, int] = {}
