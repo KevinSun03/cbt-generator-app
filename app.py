@@ -9,23 +9,62 @@ import streamlit as st
 from cbt_generator import generate_cbt_file
 
 
-st.set_page_config(page_title="LAXCBT Attendance Generator", page_icon="📋", layout="centered")
+st.set_page_config(page_title="Daily CBT Generator", page_icon="📋", layout="centered")
 
-st.title("LAXCBT Attendance Generator")
-st.caption("Upload NOVA, Newstart, and HRN spreadsheets, then export one attendance workbook with consistent formatting.")
+st.title("Daily CBT Generator")
+st.caption(
+    "Upload the company spreadsheets you have, then export one CBT workbook. "
+    "Newstart uses TT only; HRN uses the selected date's weekday column."
+)
 
 with st.form("cbt_form"):
     work_date = st.date_input("CBT date", value=date.today())
 
-    nova_file = st.file_uploader("Upload NOVA spreadsheet", type=["xlsx"], key="nova")
-    newstart_file = st.file_uploader("Upload Newstart spreadsheet", type=["xlsx"], key="newstart")
-    hrn_file = st.file_uploader("Upload HRN spreadsheet", type=["xlsx"], key="hrn")
+    st.subheader("Companies to include")
+    st.caption("Uncheck a company when that company did not work or you do not have that spreadsheet.")
+
+    include_nova = st.checkbox("Include NOVA", value=True)
+    nova_file = None
+    if include_nova:
+        nova_file = st.file_uploader("Upload NOVA spreadsheet", type=["xlsx"], key="nova")
+
+    include_newstart = st.checkbox("Include Newstart", value=True)
+    newstart_file = None
+    if include_newstart:
+        newstart_file = st.file_uploader("Upload Newstart spreadsheet", type=["xlsx"], key="newstart")
+
+    include_hrn = st.checkbox("Include HRN", value=True)
+    hrn_file = None
+    if include_hrn:
+        hrn_file = st.file_uploader("Upload HRN spreadsheet", type=["xlsx"], key="hrn")
 
     submitted = st.form_submit_button("Generate CBT Excel", type="primary")
 
 if submitted:
-    if not (nova_file and newstart_file and hrn_file):
-        st.error("Please upload all 3 spreadsheets.")
+    selected_files = {
+        "NOVA": nova_file if include_nova else None,
+        "Newstart": newstart_file if include_newstart else None,
+        "HRN": hrn_file if include_hrn else None,
+    }
+
+    selected_companies = [company for company, file in selected_files.items() if file is not None]
+    missing_selected = [
+        company
+        for company, file in selected_files.items()
+        if ((company == "NOVA" and include_nova) or (company == "Newstart" and include_newstart) or (company == "HRN" and include_hrn))
+        and file is None
+    ]
+
+    if not (include_nova or include_newstart or include_hrn):
+        st.error("Please select at least one company to include.")
+        st.stop()
+
+    if missing_selected:
+        st.error("Please upload the selected spreadsheet(s): " + ", ".join(missing_selected))
+        st.stop()
+
+    if not selected_companies:
+        st.error("Please upload at least one spreadsheet.")
         st.stop()
 
     mmdd = f"{work_date.month:02d}{work_date.day:02d}"
@@ -33,14 +72,23 @@ if submitted:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        nova_path = tmp / "nova.xlsx"
-        newstart_path = tmp / "newstart.xlsx"
-        hrn_path = tmp / "hrn.xlsx"
         output_path = tmp / out_name
 
-        nova_path.write_bytes(nova_file.getvalue())
-        newstart_path.write_bytes(newstart_file.getvalue())
-        hrn_path.write_bytes(hrn_file.getvalue())
+        nova_path = None
+        newstart_path = None
+        hrn_path = None
+
+        if nova_file is not None:
+            nova_path = tmp / "nova.xlsx"
+            nova_path.write_bytes(nova_file.getvalue())
+
+        if newstart_file is not None:
+            newstart_path = tmp / "newstart.xlsx"
+            newstart_path.write_bytes(newstart_file.getvalue())
+
+        if hrn_file is not None:
+            hrn_path = tmp / "hrn.xlsx"
+            hrn_path.write_bytes(hrn_file.getvalue())
 
         try:
             result = generate_cbt_file(
@@ -56,13 +104,7 @@ if submitted:
             st.stop()
 
         st.success("CBT workbook generated.")
-        st.write(
-            {
-                "NOVA rows": result["counts"]["NOVA"],
-                "Newstart rows": result["counts"]["Newstart"],
-                "HRN rows": result["counts"]["HRN"],
-            }
-        )
+        st.write({f"{company} rows": count for company, count in result["counts"].items()})
 
         st.download_button(
             label=f"Download {out_name}",
