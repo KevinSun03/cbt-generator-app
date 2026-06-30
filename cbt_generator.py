@@ -225,18 +225,62 @@ def _parse_newstart_sheet(ws, company: str = "Newstart") -> list[AttendanceRow]:
     return rows
 
 
+def _newstart_sheet_is_tt(ws) -> bool:
+    """Return True when this Newstart worksheet represents TT.
+
+    Supports both old format:
+        worksheet tab name = TT
+
+    and new format:
+        row near top contains 公司 / Company and nearby cell = TT
+    """
+    title = clean_text(ws.title).upper().replace(" ", "")
+    if title == "TT" or "TT" in title:
+        return True
+
+    # Check the top area for 公司: TT / Company: TT
+    max_row = min(ws.max_row, 10)
+    max_col = min(ws.max_column, 12)
+
+    for r in range(1, max_row + 1):
+        row_values = [clean_text(ws.cell(r, c).value) for c in range(1, max_col + 1)]
+        row_joined = " ".join(row_values).upper().replace(" ", "")
+
+        # Case: 公司 TT is on the same row
+        if ("公司" in row_joined or "COMPANY" in row_joined) and "TT" in row_joined:
+            return True
+
+        # Case: one cell is 公司, nearby cell is TT
+        for c in range(1, max_col + 1):
+            cell = clean_text(ws.cell(r, c).value)
+            if cell in {"公司", "公司 ", "Company", "COMPANY"}:
+                nearby = [
+                    clean_text(ws.cell(r, cc).value).upper().replace(" ", "")
+                    for cc in range(c + 1, min(max_col, c + 4) + 1)
+                ]
+                if "TT" in nearby:
+                    return True
+
+    return False
+
+
 def parse_newstart(wb, tt_only: bool = True) -> list[AttendanceRow]:
     rows: list[AttendanceRow] = []
+
     for ws in wb.worksheets:
-        if tt_only and ws.title.strip().upper() != "TT":
+        if tt_only and not _newstart_sheet_is_tt(ws):
             continue
+
         parsed = _parse_newstart_sheet(ws)
-        # For non-TT sheets, preserve the sheet/team name when no position is available.
-        if not tt_only and ws.title.strip().upper() != "TT":
+
+        # If not TT-only in the future, keep non-TT sheet name as fallback note.
+        if not tt_only and not _newstart_sheet_is_tt(ws):
             for row in parsed:
                 if not row.note:
                     row.note = ws.title
+
         rows.extend(parsed)
+
     return rows
 
 
