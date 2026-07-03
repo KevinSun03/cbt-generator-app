@@ -294,6 +294,37 @@ WEEKDAY_ALIASES = {
     6: {"sunday", "sun", "domingo"},
 }
 
+def _is_hrn_second_shift_sheet(ws) -> bool:
+    """Return True only for HRN second shift worksheets."""
+    title = clean_text(ws.title).lower().replace("_", " ").replace("-", " ")
+
+    second_shift_keywords = [
+        "second shift",
+        "2nd shift",
+        "second",
+        "2nd",
+        "shift 2",
+        "第二班",
+        "二班",
+        "晚班",
+    ]
+
+    first_shift_keywords = [
+        "first shift",
+        "1st shift",
+        "first",
+        "1st",
+        "shift 1",
+        "第一班",
+        "一班",
+        "早班",
+    ]
+
+    if any(keyword in title for keyword in first_shift_keywords):
+        return False
+
+    return any(keyword in title for keyword in second_shift_keywords)
+
 
 def _weekday_key(v) -> str:
     return clean_text(v).lower().strip(" .:-")
@@ -476,18 +507,21 @@ def _parse_hrn_weekly_sheet(ws, target_date: date | None = None) -> list[Attenda
 
 
 def _parse_hrn_weekly(wb, target_date: date | None = None) -> list[AttendanceRow]:
-    """Parse all HRN weekly worksheets and combine them.
+    """Parse only HRN Second Shift weekly worksheets.
 
-    Example HRN workbook:
-        Sheet 1: First shift
-        Sheet 2: Second Shift
+    HRN workbook may contain:
+        - First shift
+        - Second Shift
 
-    Both sheets are parsed using the same selected weekday,
-    then combined into one HRN list for the final HRN_MMDD CBT sheet.
+    We only want Second Shift. The selected weekday is still based on target_date's
+    weekday name, not the date row.
     """
     all_rows: list[AttendanceRow] = []
 
     for ws in wb.worksheets:
+        if not _is_hrn_second_shift_sheet(ws):
+            continue
+
         sheet_rows = _parse_hrn_weekly_sheet(ws, target_date=target_date)
         all_rows.extend(sheet_rows)
 
@@ -498,20 +532,19 @@ def parse_hrn(wb, target_date: date | None = None) -> list[AttendanceRow]:
     """Parse HRN workbook.
 
     Main behavior:
-        HRN weekly workbook:
-            - Parse every worksheet, including First shift and Second Shift.
-            - Pick only the column pair matching target_date's weekday name.
-            - Combine all rows into one HRN output sheet.
+        - If HRN weekly format is detected, parse Second Shift only.
+        - Ignore First Shift.
+        - Pick only the weekday column matching target_date.
+        - Output all Second Shift rows into one HRN CBT sheet.
 
     Fallback:
-        If no weekly table is found, try old daily attendance format.
+        - Only use old daily attendance parser if the workbook is not weekly format.
     """
-    weekly_rows = _parse_hrn_weekly(wb, target_date=target_date)
+    has_weekly_format = any(_find_hrn_weekly_blocks(ws) for ws in wb.worksheets)
 
-    if weekly_rows:
-        return weekly_rows
+    if has_weekly_format:
+        return _parse_hrn_weekly(wb, target_date=target_date)
 
-    # Fallback only for true daily attendance sheets.
     attendance_rows = extract_attendance_sheet_rows(
         wb,
         "HRN",
