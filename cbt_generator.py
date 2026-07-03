@@ -1,23 +1,23 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from copy import copy
-import re
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Sequence
+import re
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-from openpyxl.utils import get_column_letter
-from zoneinfo import ZoneInfo
+
+
 LA_TZ = ZoneInfo("America/Los_Angeles")
 
 
 def today_la() -> date:
     return datetime.now(LA_TZ).date()
-    
+
+
 @dataclass
 class AttendanceRow:
     name: str
@@ -38,7 +38,6 @@ def clean_text(v) -> str:
 
 def normalize_name(v) -> str:
     s = clean_text(v)
-    # Remove accidental strike-through-ish characters and extra punctuation around names.
     s = s.strip(" -–—_/\\")
     return s
 
@@ -46,11 +45,25 @@ def normalize_name(v) -> str:
 def is_bad_name(name: str) -> bool:
     if not name:
         return True
-    low = name.lower()
-    if low in {"name", "full name", "employee", "姓名", "no", "编号"}:
+
+    low = name.lower().strip()
+
+    exact_bad = {
+        "name",
+        "full name",
+        "employee",
+        "employee name",
+        "姓名",
+        "no",
+        "编号",
+    }
+
+    if low in exact_bad:
         return True
+
     if "attendance" in low or "date" in low or "公司" in name:
         return True
+
     return False
 
 
@@ -73,7 +86,7 @@ def normalize_time(v) -> str | None:
         return f"{h}:{m:02d}"
 
     if isinstance(v, (int, float)):
-        # Excel serial fraction for a time.
+        # Excel serial fraction for time.
         if 0 <= float(v) < 1:
             total = int(round(float(v) * 24 * 3600))
             total %= 24 * 3600
@@ -86,13 +99,14 @@ def normalize_time(v) -> str | None:
     if not s:
         return None
 
-    # Fix common punctuation / OCR / manual entry variants.
     s = s.replace("；", ":").replace(";", ":").replace("：", ":").replace(".", ":")
     s = re.sub(r"\s+", "", s)
     s = s.lower().replace("am", "").replace("pm", "")
+
     m = re.search(r"(\d{1,2})(?::(\d{1,2}))?", s)
     if not m:
         return clean_text(v)
+
     h = int(m.group(1))
     minute = int(m.group(2) or 0)
     return f"{h}:{minute:02d}"
@@ -104,73 +118,106 @@ def extract_date_from_workbook(wb) -> date | None:
             for v in row:
                 if isinstance(v, datetime):
                     return v.date()
+
                 if isinstance(v, date):
                     return v
+
                 s = clean_text(v)
                 if not s:
                     continue
-                # Examples: "日期 Date ：6/24/2026", "日期Date:6-24-2026"
+
                 m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
                 if m:
                     month, day, year = map(int, m.groups())
                     if year < 100:
                         year += 2000
+
                     try:
                         return date(year, month, day)
                     except ValueError:
                         pass
+
     return None
 
 
 def _header_blocks(ws) -> list[tuple[int, int, int, int, int]]:
-    """Return (header_row, name_col, position_col, in_col, out_col) for attendance-style sheets."""
+    """Return (header_row, name_col, position_col, in_col, out_col)."""
     blocks = []
-    max_scan_row = min(ws.max_row, 12)
+    max_scan_row = min(ws.max_row, 20)
+
     for r in range(1, max_scan_row + 1):
         for c in range(1, ws.max_column + 1):
             v = clean_text(ws.cell(r, c).value).lower()
+
             if v in {"full name", "name"} or "full name" in v:
-                # Usually: Name, Position, Time in, Time out
                 blocks.append((r, c, c + 1, c + 2, c + 3))
+
             elif clean_text(ws.cell(r, c).value) == "姓名":
-                # Usually Chinese header row above English header.
-                # Use it only if the nearby columns match 上班/下班.
-                nearby = " ".join(clean_text(ws.cell(r, cc).value) for cc in range(c, min(ws.max_column, c + 4) + 1))
+                nearby = " ".join(
+                    clean_text(ws.cell(r, cc).value)
+                    for cc in range(c, min(ws.max_column, c + 4) + 1)
+                )
                 if "上班" in nearby or "下班" in nearby:
                     blocks.append((r, c, c + 1, c + 2, c + 3))
-    # Deduplicate same block where Chinese + English headers both match.
+
     seen = set()
     unique = []
+
     for item in blocks:
-        key = item[1]
+        key = (item[0], item[1])
         if key not in seen:
             seen.add(key)
             unique.append(item)
+
     return unique
 
 
-def extract_attendance_sheet_rows(wb, company: str, default_note: str | None = None) -> list[AttendanceRow]:
-    """Parse NOVA/Newstart daily sign-in sheets with one or two side-by-side blocks."""
+def extract_attendance_sheet_rows(
+    wb,
+    company: str,
+    default_note: str | None = None,
+) -> list[AttendanceRow]:
+    """Parse NOVA/Newstart daily sign-in sheets."""
     rows: list[AttendanceRow] = []
+
     for ws in wb.worksheets:
         blocks = _header_blocks(ws)
+
         if not blocks:
             continue
+
         for header_row, name_col, pos_col, in_col, out_col in blocks:
             for r in range(header_row + 1, ws.max_row + 1):
                 name = normalize_name(ws.cell(r, name_col).value)
+
                 if is_bad_name(name):
                     continue
+
                 if "备注" in name or "note" in name.lower():
                     continue
+
                 time_in = normalize_time(ws.cell(r, in_col).value)
                 time_out = normalize_time(ws.cell(r, out_col).value)
                 pos = clean_text(ws.cell(r, pos_col).value) or default_note
+
                 if not time_in and not time_out and not pos:
-                    # Avoid picking up stray names without attendance data.
                     continue
-                rows.append(AttendanceRow(name=name, company=company, time_in=time_in, time_out=time_out, note=pos))
+
+                rows.append(
+                    AttendanceRow(
+                        name=name,
+                        company=company,
+                        time_in=time_in,
+                        time_out=time_out,
+                        note=pos,
+                    )
+                )
+
     return rows
+
+
+def parse_nova(wb) -> list[AttendanceRow]:
+    return extract_attendance_sheet_rows(wb, "NOVA")
 
 
 NEWSTART_NOTE_MAP = {
@@ -191,73 +238,86 @@ NEWSTART_NOTE_MAP = {
 def _parse_newstart_sheet(ws, company: str = "Newstart") -> list[AttendanceRow]:
     rows: list[AttendanceRow] = []
     blocks = _header_blocks(ws)
+
     if not blocks:
         return rows
 
     current_section_note: str | None = None
+
     for header_row, name_col, pos_col, in_col, out_col in blocks:
         for r in range(header_row + 1, ws.max_row + 1):
             raw_name = clean_text(ws.cell(r, name_col).value)
+
             if not raw_name:
                 continue
 
             if "备注" in raw_name or "note" in raw_name.lower():
-                # Example: 备注:主仓加班
                 parts = re.split(r"[:：]", raw_name, maxsplit=1)
+
                 if len(parts) == 2:
                     current_section_note = clean_text(parts[1])
                 else:
                     current_section_note = raw_name.replace("备注", "").strip(":： ")
+
                 continue
 
             name = normalize_name(raw_name)
+
             if is_bad_name(name):
                 continue
 
             time_in = normalize_time(ws.cell(r, in_col).value)
             time_out = normalize_time(ws.cell(r, out_col).value)
             pos = clean_text(ws.cell(r, pos_col).value)
+
             if not time_in and not time_out and not pos:
                 continue
 
             note = pos or current_section_note or NEWSTART_NOTE_MAP.get(name, "")
-            rows.append(AttendanceRow(name=name, company=company, time_in=time_in, time_out=time_out, note=note))
+
+            rows.append(
+                AttendanceRow(
+                    name=name,
+                    company=company,
+                    time_in=time_in,
+                    time_out=time_out,
+                    note=note,
+                )
+            )
+
     return rows
 
 
 def _newstart_sheet_is_tt(ws) -> bool:
-    """Return True when this Newstart worksheet represents TT.
-
-    Supports both old format:
-        worksheet tab name = TT
-
-    and new format:
-        row near top contains 公司 / Company and nearby cell = TT
-    """
+    """Detect TT sheet even when sheet tab is not named TT."""
     title = clean_text(ws.title).upper().replace(" ", "")
+
     if title == "TT" or "TT" in title:
         return True
 
-    # Check the top area for 公司: TT / Company: TT
-    max_row = min(ws.max_row, 10)
-    max_col = min(ws.max_column, 12)
+    max_row = min(ws.max_row, 15)
+    max_col = min(ws.max_column, 15)
 
     for r in range(1, max_row + 1):
-        row_values = [clean_text(ws.cell(r, c).value) for c in range(1, max_col + 1)]
+        row_values = [
+            clean_text(ws.cell(r, c).value)
+            for c in range(1, max_col + 1)
+        ]
+
         row_joined = " ".join(row_values).upper().replace(" ", "")
 
-        # Case: 公司 TT is on the same row
         if ("公司" in row_joined or "COMPANY" in row_joined) and "TT" in row_joined:
             return True
 
-        # Case: one cell is 公司, nearby cell is TT
         for c in range(1, max_col + 1):
-            cell = clean_text(ws.cell(r, c).value)
-            if cell in {"公司", "公司 ", "Company", "COMPANY"}:
+            cell = clean_text(ws.cell(r, c).value).upper().replace(" ", "")
+
+            if cell in {"公司", "COMPANY"}:
                 nearby = [
                     clean_text(ws.cell(r, cc).value).upper().replace(" ", "")
-                    for cc in range(c + 1, min(max_col, c + 4) + 1)
+                    for cc in range(c + 1, min(max_col, c + 5) + 1)
                 ]
+
                 if "TT" in nearby:
                     return True
 
@@ -268,13 +328,14 @@ def parse_newstart(wb, tt_only: bool = True) -> list[AttendanceRow]:
     rows: list[AttendanceRow] = []
 
     for ws in wb.worksheets:
-        if tt_only and not _newstart_sheet_is_tt(ws):
+        is_tt = _newstart_sheet_is_tt(ws)
+
+        if tt_only and not is_tt:
             continue
 
         parsed = _parse_newstart_sheet(ws)
 
-        # If not TT-only in the future, keep non-TT sheet name as fallback note.
-        if not tt_only and not _newstart_sheet_is_tt(ws):
+        if not tt_only and not is_tt:
             for row in parsed:
                 if not row.note:
                     row.note = ws.title
@@ -294,44 +355,83 @@ WEEKDAY_ALIASES = {
     6: {"sunday", "sun", "domingo"},
 }
 
-def _is_hrn_second_shift_sheet(ws) -> bool:
-    """Return True only for HRN second shift worksheets."""
-    title = clean_text(ws.title).lower().replace("_", " ").replace("-", " ")
-
-    second_shift_keywords = [
-        "second shift",
-        "2nd shift",
-        "second",
-        "2nd",
-        "shift 2",
-        "第二班",
-        "二班",
-        "晚班",
-    ]
-
-    first_shift_keywords = [
-        "first shift",
-        "1st shift",
-        "first",
-        "1st",
-        "shift 1",
-        "第一班",
-        "一班",
-        "早班",
-    ]
-
-    if any(keyword in title for keyword in first_shift_keywords):
-        return False
-
-    return any(keyword in title for keyword in second_shift_keywords)
-
 
 def _weekday_key(v) -> str:
     return clean_text(v).lower().strip(" .:-")
 
 
+def _compact_text(v) -> str:
+    """Lowercase text with spaces and punctuation removed."""
+    s = clean_text(v).lower()
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", s)
+
+
+def _hrn_shift_from_text(v) -> str | None:
+    """Detect first/second shift from title or top worksheet text."""
+    t = _compact_text(v)
+
+    if not t:
+        return None
+
+    first_markers = {
+        "firstshift",
+        "1stshift",
+        "shift1",
+        "first",
+        "1st",
+        "第一班",
+        "一班",
+        "早班",
+    }
+
+    second_markers = {
+        "secondshift",
+        "2ndshift",
+        "shift2",
+        "second",
+        "2nd",
+        "第二班",
+        "二班",
+        "晚班",
+    }
+
+    has_first = any(marker in t for marker in first_markers)
+    has_second = any(marker in t for marker in second_markers)
+
+    if has_second and not has_first:
+        return "second"
+
+    if has_first and not has_second:
+        return "first"
+
+    return None
+
+
+def _hrn_sheet_shift(ws) -> str | None:
+    """Return 'first', 'second', or None."""
+    title_shift = _hrn_shift_from_text(ws.title)
+
+    if title_shift:
+        return title_shift
+
+    max_row = min(ws.max_row, 15)
+    max_col = min(ws.max_column, 12)
+
+    for r in range(1, max_row + 1):
+        row_text = " ".join(
+            clean_text(ws.cell(r, c).value)
+            for c in range(1, max_col + 1)
+        )
+
+        row_shift = _hrn_shift_from_text(row_text)
+
+        if row_shift:
+            return row_shift
+
+    return None
+
+
 def _is_hrn_bad_employee_row(name: str) -> bool:
-    """Skip non-employee rows inside HRN weekly sheets."""
     if is_bad_name(name):
         return True
 
@@ -354,46 +454,32 @@ def _is_hrn_bad_employee_row(name: str) -> bool:
 
 
 def _find_hrn_weekly_blocks(ws) -> list[tuple[int, int, int, int]]:
-    """Find HRN weekly attendance tables.
+    """Find HRN weekly attendance blocks.
 
     Returns:
-        (employee_header_row, employee_col, weekday_row, inout_row)
-
-    HRN layout example:
-        Row 4: dates, sometimes copied/wrong. Ignore this row.
-        Row 5: Employee | Monday | Tuesday | Wednesday | ...
-        Row 6:          | IN OUT | IN OUT  | IN OUT    | ...
-
-    Important:
-        We choose the needed day by weekday name only, not by the date row.
-        This works for HRN workbooks with multiple sheets like:
-            - First shift
-            - Second Shift
-        Each sheet is parsed and combined into one HRN result.
+        employee_header_row, employee_col, weekday_row, inout_row
     """
     blocks: list[tuple[int, int, int, int]] = []
 
     max_scan_row = min(ws.max_row, 60)
     max_scan_col = min(ws.max_column, 30)
+    all_weekday_aliases = set().union(*WEEKDAY_ALIASES.values())
 
     for r in range(1, max_scan_row + 1):
         for c in range(1, max_scan_col + 1):
             cell_value = clean_text(ws.cell(r, c).value).lower()
 
-            if cell_value != "employee":
+            if cell_value not in {"employee", "employee name"}:
                 continue
 
-            # Normal HRN weekly format has weekday names on the same row as Employee,
-            # and IN/OUT labels on the next row.
             weekday_row = r
             inout_row = r + 1
 
-            # Make sure there is at least one weekday nearby.
-            nearby_weekdays = []
-            for cc in range(c + 1, min(ws.max_column, c + 16) + 1):
-                nearby_weekdays.append(_weekday_key(ws.cell(weekday_row, cc).value))
+            nearby_weekdays = [
+                _weekday_key(ws.cell(weekday_row, cc).value)
+                for cc in range(c + 1, min(ws.max_column, c + 16) + 1)
+            ]
 
-            all_weekday_aliases = set().union(*WEEKDAY_ALIASES.values())
             if any(day in all_weekday_aliases for day in nearby_weekdays):
                 blocks.append((r, c, weekday_row, inout_row))
 
@@ -407,15 +493,6 @@ def _selected_weekday_pair(
     start_col: int,
     target_date: date | None,
 ) -> tuple[int, int] | None:
-    """Return the IN/OUT columns for the selected weekday.
-
-    Example:
-        target_date = 2026-07-01
-        weekday = Wednesday
-        return Wednesday IN column and Wednesday OUT column.
-
-    The date row above the weekday row is ignored because HRN sometimes has wrong copied dates.
-    """
     if target_date is None:
         return None
 
@@ -427,39 +504,28 @@ def _selected_weekday_pair(
         if day_label not in wanted_weekday_names:
             continue
 
-        # Usually the weekday cell is merged across two columns:
-        # Wednesday | blank
-        # IN        | OUT
-        possible_in_col = c
-        possible_out_col = c + 1 if c + 1 <= ws.max_column else None
+        in_col = c
+        out_col = c + 1 if c + 1 <= ws.max_column else None
 
-        if possible_out_col is None:
+        if out_col is None:
             return None
 
-        in_label = clean_text(ws.cell(inout_row, possible_in_col).value).lower()
-        out_label = clean_text(ws.cell(inout_row, possible_out_col).value).lower()
+        in_label = clean_text(ws.cell(inout_row, in_col).value).lower()
+        out_label = clean_text(ws.cell(inout_row, out_col).value).lower()
 
         if in_label == "in" and out_label == "out":
-            return possible_in_col, possible_out_col
+            return in_col, out_col
 
-        # Fallback for imperfect files:
-        # If weekday name is found, HRN still keeps each day as a 2-column IN/OUT pair.
-        return possible_in_col, possible_out_col
+        # HRN keeps each weekday as a two-column pair.
+        return in_col, out_col
 
     return None
 
 
-def _parse_hrn_weekly_sheet(ws, target_date: date | None = None) -> list[AttendanceRow]:
-    """Parse one HRN weekly worksheet.
-
-    This handles one sheet like:
-        First shift
-
-    or:
-        Second Shift
-
-    The caller will combine all worksheet results together.
-    """
+def _parse_hrn_weekly_sheet(
+    ws,
+    target_date: date | None = None,
+) -> list[AttendanceRow]:
     rows: list[AttendanceRow] = []
 
     for header_row, employee_col, weekday_row, inout_row in _find_hrn_weekly_blocks(ws):
@@ -477,8 +543,7 @@ def _parse_hrn_weekly_sheet(ws, target_date: date | None = None) -> list[Attenda
         in_col, out_col = selected_pair
 
         for r in range(inout_row + 1, ws.max_row + 1):
-            # Stop if another weekly table starts later in the same worksheet.
-            if clean_text(ws.cell(r, employee_col).value).lower() == "employee":
+            if clean_text(ws.cell(r, employee_col).value).lower() in {"employee", "employee name"}:
                 break
 
             name = normalize_name(ws.cell(r, employee_col).value)
@@ -489,7 +554,6 @@ def _parse_hrn_weekly_sheet(ws, target_date: date | None = None) -> list[Attenda
             time_in = normalize_time(ws.cell(r, in_col).value)
             time_out = normalize_time(ws.cell(r, out_col).value)
 
-            # Only include people who actually have attendance data for the selected weekday.
             if not time_in and not time_out:
                 continue
 
@@ -506,39 +570,56 @@ def _parse_hrn_weekly_sheet(ws, target_date: date | None = None) -> list[Attenda
     return rows
 
 
-def _parse_hrn_weekly(wb, target_date: date | None = None) -> list[AttendanceRow]:
-    """Parse only HRN Second Shift weekly worksheets.
+def _select_hrn_second_shift_sheets(wb) -> list:
+    """Select only HRN Second Shift sheets.
 
-    HRN workbook may contain:
-        - First shift
-        - Second Shift
-
-    We only want Second Shift. The selected weekday is still based on target_date's
-    weekday name, not the date row.
+    Rules:
+    1. If sheet is clearly Second Shift, use it.
+    2. If multiple weekly sheets exist but names are unclear, use only the last weekly sheet.
+    3. If only one weekly sheet exists, use it for backward compatibility.
     """
-    all_rows: list[AttendanceRow] = []
+    weekly_sheets = [
+        ws for ws in wb.worksheets
+        if _find_hrn_weekly_blocks(ws)
+    ]
 
-    for ws in wb.worksheets:
-        if not _is_hrn_second_shift_sheet(ws):
-            continue
+    if not weekly_sheets:
+        return []
 
-        sheet_rows = _parse_hrn_weekly_sheet(ws, target_date=target_date)
-        all_rows.extend(sheet_rows)
+    second_shift_sheets = [
+        ws for ws in weekly_sheets
+        if _hrn_sheet_shift(ws) == "second"
+    ]
 
-    return all_rows
+    if second_shift_sheets:
+        return second_shift_sheets
+
+    if len(weekly_sheets) >= 2:
+        return [weekly_sheets[-1]]
+
+    return weekly_sheets
+
+
+def _parse_hrn_weekly(
+    wb,
+    target_date: date | None = None,
+) -> list[AttendanceRow]:
+    rows: list[AttendanceRow] = []
+
+    second_shift_sheets = _select_hrn_second_shift_sheets(wb)
+
+    for ws in second_shift_sheets:
+        rows.extend(_parse_hrn_weekly_sheet(ws, target_date=target_date))
+
+    return rows
 
 
 def parse_hrn(wb, target_date: date | None = None) -> list[AttendanceRow]:
     """Parse HRN workbook.
 
-    Main behavior:
-        - If HRN weekly format is detected, parse Second Shift only.
-        - Ignore First Shift.
-        - Pick only the weekday column matching target_date.
-        - Output all Second Shift rows into one HRN CBT sheet.
-
-    Fallback:
-        - Only use old daily attendance parser if the workbook is not weekly format.
+    HRN rule:
+        Weekly workbook = Second Shift only.
+        Never combine First Shift and Second Shift.
     """
     has_weekly_format = any(_find_hrn_weekly_blocks(ws) for ws in wb.worksheets)
 
@@ -557,9 +638,6 @@ def parse_hrn(wb, target_date: date | None = None) -> list[AttendanceRow]:
 
     return attendance_rows
 
-def parse_nova(wb) -> list[AttendanceRow]:
-    return extract_attendance_sheet_rows(wb, "NOVA")
-
 
 def _format_date_display(d: date) -> str:
     return f"{d.month}/{d.day}/{d.year}"
@@ -573,18 +651,10 @@ def build_cbt_workbook(
     company_rows: Sequence[tuple[str, Sequence[AttendanceRow]]],
     work_date: date,
 ) -> Workbook:
-    """Build a CBT workbook using only the companies provided.
-
-    Example company_rows:
-        [("NOVA", nova_rows), ("HRN", hrn_rows)]
-
-    This allows days where only one or two companies worked.
-    """
     if not company_rows:
         raise ValueError("No company data was provided. Select/upload at least one spreadsheet.")
 
     wb = Workbook()
-    # Remove default sheet.
     wb.remove(wb.active)
 
     for company, rows in company_rows:
@@ -594,9 +664,21 @@ def build_cbt_workbook(
     return wb
 
 
-def write_cbt_sheet(ws, rows: Sequence[AttendanceRow], company: str, work_date: date):
-    # Page + dimensions
-    widths = {"A": 9, "B": 28, "C": 16, "D": 16, "E": 16, "F": 26}
+def write_cbt_sheet(
+    ws,
+    rows: Sequence[AttendanceRow],
+    company: str,
+    work_date: date,
+):
+    widths = {
+        "A": 9,
+        "B": 28,
+        "C": 16,
+        "D": 16,
+        "E": 16,
+        "F": 26,
+    }
+
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
@@ -608,13 +690,17 @@ def write_cbt_sheet(ws, rows: Sequence[AttendanceRow], company: str, work_date: 
     ws.merge_cells("A2:F2")
 
     ws["A1"] = "CBT考勤"
-    ws["A2"] = f"日期：{_format_date_display(work_date)}　　　　公司：{company}　　　　填表人：________"
+    ws["A2"] = (
+        f"日期：{_format_date_display(work_date)}　　　　"
+        f"公司：{company}　　　　"
+        f"填表人：________"
+    )
 
     headers = ["编号", "姓名", "劳务公司", "上班时间", "下班时间", "备注"]
+
     for col_idx, h in enumerate(headers, 1):
         ws.cell(3, col_idx).value = h
 
-    # Styles
     blue = "2F75B5"
     light_blue = "BDD7EE"
     band_blue = "D9E8FA"
@@ -635,26 +721,39 @@ def write_cbt_sheet(ws, rows: Sequence[AttendanceRow], company: str, work_date: 
 
     ws["A1"].fill = title_fill
     ws["A1"].font = Font(name="Arial", size=18, bold=True, color="FFFFFF")
+
     ws["A2"].fill = meta_fill
     ws["A2"].font = Font(name="Arial", size=12, color="1F1F1F")
+
     for c in range(1, 7):
         ws.cell(3, c).fill = header_fill
         ws.cell(3, c).font = Font(name="Arial", size=12, bold=True, color="1F4E79")
 
-    # Data rows
     for idx, row in enumerate(rows, 1):
         excel_row = idx + 3
-        values = [idx, row.name, row.company, row.time_in or "", row.time_out or "", row.note or ""]
+
+        values = [
+            idx,
+            row.name,
+            row.company,
+            row.time_in or "",
+            row.time_out or "",
+            row.note or "",
+        ]
+
         for c, value in enumerate(values, 1):
             cell = ws.cell(excel_row, c)
             cell.value = value
             cell.border = border
             cell.font = Font(name="Arial", size=12)
             cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.fill = PatternFill("solid", fgColor=band_blue if idx % 2 == 1 else band_white)
+            cell.fill = PatternFill(
+                "solid",
+                fgColor=band_blue if idx % 2 == 1 else band_white,
+            )
+
         ws.row_dimensions[excel_row].height = 24
 
-    # Freeze header and print setup.
     ws.freeze_panes = "A4"
     ws.sheet_view.showGridLines = False
     ws.page_setup.orientation = "landscape"
@@ -672,11 +771,6 @@ def generate_cbt_file(
     work_date: date | None = None,
     newstart_tt_only: bool = True,
 ) -> dict:
-    """Generate a CBT workbook from any available company spreadsheets.
-
-    Pass None for a company path when that company should be skipped for the day.
-    Only the provided companies will become sheets in the final workbook.
-    """
     if nova_path is None and newstart_path is None and hrn_path is None:
         raise ValueError("No spreadsheets were provided. Upload at least one company spreadsheet.")
 
@@ -685,8 +779,19 @@ def generate_cbt_file(
     hrn_wb = load_workbook(hrn_path, data_only=True) if hrn_path is not None else None
 
     if work_date is None:
-        workbook_candidates = [wb for wb in [nova_wb, newstart_wb, hrn_wb] if wb is not None]
-        work_date = next((extract_date_from_workbook(wb) for wb in workbook_candidates if extract_date_from_workbook(wb)), None) or today_la()
+        workbook_candidates = [
+            wb for wb in [nova_wb, newstart_wb, hrn_wb]
+            if wb is not None
+        ]
+
+        found_date = None
+
+        for wb in workbook_candidates:
+            found_date = extract_date_from_workbook(wb)
+            if found_date:
+                break
+
+        work_date = found_date or today_la()
 
     company_rows: list[tuple[str, list[AttendanceRow]]] = []
     counts: dict[str, int] = {}
@@ -713,5 +818,8 @@ def generate_cbt_file(
         "output_path": str(output_path),
         "date": work_date.isoformat(),
         "counts": counts,
-        "sheets": [f"{company}_{_mmdd(work_date)}" for company, _ in company_rows],
+        "sheets": [
+            f"{company}_{_mmdd(work_date)}"
+            for company, _ in company_rows
+        ],
     }
