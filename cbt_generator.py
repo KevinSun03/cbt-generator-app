@@ -299,93 +299,230 @@ def _weekday_key(v) -> str:
     return clean_text(v).lower().strip(" .:-")
 
 
-def _find_hrn_weekly_blocks(ws) -> list[tuple[int, int, int, int]]:
-    """Return HRN weekly blocks as (employee_header_row, employee_col, weekday_row, inout_row).
+def _is_hrn_bad_employee_row(name: str) -> bool:
+    """Skip non-employee rows inside HRN weekly sheets."""
+    if is_bad_name(name):
+        return True
 
-    HRN files are usually weekly sheets: Employee | Monday IN/OUT | Tuesday IN/OUT ...
-    The date row above the weekday row is not trusted because it is sometimes copied from
-    another week. We choose the target day by weekday name instead.
+    low = name.lower().strip()
+
+    bad_keywords = [
+        "total",
+        "subtotal",
+        "hours",
+        "signature",
+        "supervisor",
+        "manager",
+        "question",
+        "concerns",
+        "please reach out",
+        "si tiene",
+    ]
+
+    return any(keyword in low for keyword in bad_keywords)
+
+
+def _find_hrn_weekly_blocks(ws) -> list[tuple[int, int, int, int]]:
+    """Find HRN weekly attendance tables.
+
+    Returns:
+        (employee_header_row, employee_col, weekday_row, inout_row)
+
+    HRN layout example:
+        Row 4: dates, sometimes copied/wrong. Ignore this row.
+        Row 5: Employee | Monday | Tuesday | Wednesday | ...
+        Row 6:          | IN OUT | IN OUT  | IN OUT    | ...
+
+    Important:
+        We choose the needed day by weekday name only, not by the date row.
+        This works for HRN workbooks with multiple sheets like:
+            - First shift
+            - Second Shift
+        Each sheet is parsed and combined into one HRN result.
     """
     blocks: list[tuple[int, int, int, int]] = []
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, min(ws.max_column, 10) + 1):
-            if clean_text(ws.cell(r, c).value).lower() == "employee":
-                blocks.append((r, c, r, r + 1))
+
+    max_scan_row = min(ws.max_row, 60)
+    max_scan_col = min(ws.max_column, 30)
+
+    for r in range(1, max_scan_row + 1):
+        for c in range(1, max_scan_col + 1):
+            cell_value = clean_text(ws.cell(r, c).value).lower()
+
+            if cell_value != "employee":
+                continue
+
+            # Normal HRN weekly format has weekday names on the same row as Employee,
+            # and IN/OUT labels on the next row.
+            weekday_row = r
+            inout_row = r + 1
+
+            # Make sure there is at least one weekday nearby.
+            nearby_weekdays = []
+            for cc in range(c + 1, min(ws.max_column, c + 16) + 1):
+                nearby_weekdays.append(_weekday_key(ws.cell(weekday_row, cc).value))
+
+            all_weekday_aliases = set().union(*WEEKDAY_ALIASES.values())
+            if any(day in all_weekday_aliases for day in nearby_weekdays):
+                blocks.append((r, c, weekday_row, inout_row))
+
     return blocks
 
 
-def _selected_weekday_pair(ws, weekday_row: int, inout_row: int, start_col: int, target_date: date | None) -> tuple[int, int] | None:
+def _selected_weekday_pair(
+    ws,
+    weekday_row: int,
+    inout_row: int,
+    start_col: int,
+    target_date: date | None,
+) -> tuple[int, int] | None:
+    """Return the IN/OUT columns for the selected weekday.
+
+    Example:
+        target_date = 2026-07-01
+        weekday = Wednesday
+        return Wednesday IN column and Wednesday OUT column.
+
+    The date row above the weekday row is ignored because HRN sometimes has wrong copied dates.
+    """
     if target_date is None:
         return None
 
-    wanted = WEEKDAY_ALIASES[target_date.weekday()]
+    wanted_weekday_names = WEEKDAY_ALIASES[target_date.weekday()]
 
     for c in range(start_col, ws.max_column + 1):
         day_label = _weekday_key(ws.cell(weekday_row, c).value)
-        if day_label not in wanted:
+
+        if day_label not in wanted_weekday_names:
             continue
 
-        in_col = c
-        out_col = c + 1 if c + 1 <= ws.max_column else None
-        in_label = clean_text(ws.cell(inout_row, in_col).value).lower()
-        out_label = clean_text(ws.cell(inout_row, out_col).value).lower() if out_col else ""
+        # Usually the weekday cell is merged across two columns:
+        # Wednesday | blank
+        # IN        | OUT
+        possible_in_col = c
+        possible_out_col = c + 1 if c + 1 <= ws.max_column else None
 
-        # Normal HRN layout is weekday merged across two columns with IN then OUT below it.
+        if possible_out_col is None:
+            return None
+
+        in_label = clean_text(ws.cell(inout_row, possible_in_col).value).lower()
+        out_label = clean_text(ws.cell(inout_row, possible_out_col).value).lower()
+
         if in_label == "in" and out_label == "out":
-            return in_col, out_col
+            return possible_in_col, possible_out_col
 
-        # Fallback: if the weekday header is found but the IN/OUT labels are imperfect,
-        # still use this column and the next column because HRN keeps day pairs together.
-        if out_col:
-            return in_col, out_col
+        # Fallback for imperfect files:
+        # If weekday name is found, HRN still keeps each day as a 2-column IN/OUT pair.
+        return possible_in_col, possible_out_col
 
     return None
 
 
-def _parse_hrn_weekly(wb, target_date: date | None = None) -> list[AttendanceRow]:
+def _parse_hrn_weekly_sheet(ws, target_date: date | None = None) -> list[AttendanceRow]:
+    """Parse one HRN weekly worksheet.
+
+    This handles one sheet like:
+        First shift
+
+    or:
+        Second Shift
+
+    The caller will combine all worksheet results together.
+    """
     rows: list[AttendanceRow] = []
 
-    for ws in wb.worksheets:
-        for header_row, employee_col, weekday_row, inout_row in _find_hrn_weekly_blocks(ws):
-            selected_pair = _selected_weekday_pair(ws, weekday_row, inout_row, employee_col + 1, target_date)
-            if selected_pair is None:
+    for header_row, employee_col, weekday_row, inout_row in _find_hrn_weekly_blocks(ws):
+        selected_pair = _selected_weekday_pair(
+            ws=ws,
+            weekday_row=weekday_row,
+            inout_row=inout_row,
+            start_col=employee_col + 1,
+            target_date=target_date,
+        )
+
+        if selected_pair is None:
+            continue
+
+        in_col, out_col = selected_pair
+
+        for r in range(inout_row + 1, ws.max_row + 1):
+            # Stop if another weekly table starts later in the same worksheet.
+            if clean_text(ws.cell(r, employee_col).value).lower() == "employee":
+                break
+
+            name = normalize_name(ws.cell(r, employee_col).value)
+
+            if _is_hrn_bad_employee_row(name):
                 continue
 
-            in_col, out_col = selected_pair
+            time_in = normalize_time(ws.cell(r, in_col).value)
+            time_out = normalize_time(ws.cell(r, out_col).value)
 
-            for r in range(inout_row + 1, ws.max_row + 1):
-                # Stop if another repeated weekly header starts later in the same sheet.
-                if clean_text(ws.cell(r, employee_col).value).lower() == "employee":
-                    break
+            # Only include people who actually have attendance data for the selected weekday.
+            if not time_in and not time_out:
+                continue
 
-                name = normalize_name(ws.cell(r, employee_col).value)
-                if is_bad_name(name):
-                    continue
-
-                tin = normalize_time(ws.cell(r, in_col).value)
-                tout = normalize_time(ws.cell(r, out_col).value)
-                if not tin and not tout:
-                    continue
-
-                rows.append(AttendanceRow(name=name, company="HRN", time_in=tin, time_out=tout, note="LA-TT分拣"))
+            rows.append(
+                AttendanceRow(
+                    name=name,
+                    company="HRN",
+                    time_in=time_in,
+                    time_out=time_out,
+                    note="LA-TT分拣",
+                )
+            )
 
     return rows
 
 
+def _parse_hrn_weekly(wb, target_date: date | None = None) -> list[AttendanceRow]:
+    """Parse all HRN weekly worksheets and combine them.
+
+    Example HRN workbook:
+        Sheet 1: First shift
+        Sheet 2: Second Shift
+
+    Both sheets are parsed using the same selected weekday,
+    then combined into one HRN list for the final HRN_MMDD CBT sheet.
+    """
+    all_rows: list[AttendanceRow] = []
+
+    for ws in wb.worksheets:
+        sheet_rows = _parse_hrn_weekly_sheet(ws, target_date=target_date)
+        all_rows.extend(sheet_rows)
+
+    return all_rows
+
+
 def parse_hrn(wb, target_date: date | None = None) -> list[AttendanceRow]:
-    # HRN spreadsheets are normally weekly. Choose the day by weekday name
-    # (Monday/Tuesday/etc.) and ignore the date row because the copied date row can be wrong.
+    """Parse HRN workbook.
+
+    Main behavior:
+        HRN weekly workbook:
+            - Parse every worksheet, including First shift and Second Shift.
+            - Pick only the column pair matching target_date's weekday name.
+            - Combine all rows into one HRN output sheet.
+
+    Fallback:
+        If no weekly table is found, try old daily attendance format.
+    """
     weekly_rows = _parse_hrn_weekly(wb, target_date=target_date)
+
     if weekly_rows:
         return weekly_rows
 
     # Fallback only for true daily attendance sheets.
-    attendance_rows = extract_attendance_sheet_rows(wb, "HRN", default_note="LA-TT分拣")
+    attendance_rows = extract_attendance_sheet_rows(
+        wb,
+        "HRN",
+        default_note="LA-TT分拣",
+    )
+
     for row in attendance_rows:
         if not row.note:
             row.note = "LA-TT分拣"
-    return attendance_rows
 
+    return attendance_rows
 
 def parse_nova(wb) -> list[AttendanceRow]:
     return extract_attendance_sheet_rows(wb, "NOVA")
