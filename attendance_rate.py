@@ -9,45 +9,97 @@ from typing import Iterable, Sequence
 
 from openai import OpenAI
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import (
+    Alignment,
+    Border,
+    Font,
+    PatternFill,
+    Side,
+)
+from openpyxl.utils import get_column_letter
 
+
+# ============================================================================
+# General helpers
+# ============================================================================
 
 def _clean(value) -> str:
     if value is None:
         return ""
 
-    return re.sub(r"\s+", " ", str(value).strip())
-
-
-def _image_data_url(uploaded_file) -> str:
-    mime = getattr(uploaded_file, "type", None) or "image/jpeg"
-    encoded = base64.b64encode(
-        uploaded_file.getvalue()
-    ).decode("utf-8")
-
-    return f"data:{mime};base64,{encoded}"
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value).strip(),
+    )
 
 
 def _name_key(name: str) -> str:
     return re.sub(
         r"[^a-z0-9\u4e00-\u9fff]+",
         "",
-        name.lower(),
+        _clean(name).lower(),
     )
 
 
-def merge_duplicate_rows(rows: Iterable[dict]) -> list[dict]:
-    """
-    Merge duplicate employee rows when multiple uploaded photos overlap.
-    """
+def _image_data_url(uploaded_file) -> str:
+    mime_type = (
+        getattr(
+            uploaded_file,
+            "type",
+            None,
+        )
+        or "image/jpeg"
+    )
 
+    encoded = base64.b64encode(
+        uploaded_file.getvalue()
+    ).decode("utf-8")
+
+    return (
+        f"data:{mime_type};base64,"
+        f"{encoded}"
+    )
+
+
+def _combine_notes(*notes: str) -> str:
+    unique_notes = []
+
+    for note in notes:
+        cleaned = _clean(note)
+
+        if (
+            cleaned
+            and cleaned not in unique_notes
+        ):
+            unique_notes.append(cleaned)
+
+    return "; ".join(unique_notes)
+
+
+# ============================================================================
+# Duplicate handling
+# ============================================================================
+
+def merge_duplicate_rows(
+    rows: Iterable[dict],
+) -> list[dict]:
+    """
+    Merge overlapping employee rows from multiple uploaded photos.
+
+    Rows are matched by normalized employee name. If two photos contain
+    conflicting times, the first value is retained and the conflict is
+    added to OCR Notes for manual review.
+    """
     merged: dict[str, dict] = {}
     order: list[str] = []
 
     confidence_rank = {
-        "low": 0,
-        "medium": 1,
-        "high": 2,
+        "": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "manual": 4,
     }
 
     for row in rows:
@@ -59,12 +111,21 @@ def merge_duplicate_rows(rows: Iterable[dict]) -> list[dict]:
 
         candidate = {
             "Name": name,
-            "Check In": _clean(row.get("Check In")),
-            "Check Out": _clean(row.get("Check Out")),
-            "Confidence": (
-                _clean(row.get("Confidence")) or "low"
+            "Check In": _clean(
+                row.get("Check In")
             ),
-            "OCR Notes": _clean(row.get("OCR Notes")),
+            "Check Out": _clean(
+                row.get("Check Out")
+            ),
+            "Confidence": (
+                _clean(
+                    row.get("Confidence")
+                ).lower()
+                or "low"
+            ),
+            "OCR Notes": _clean(
+                row.get("OCR Notes")
+            ),
         }
 
         if key not in merged:
@@ -73,94 +134,173 @@ def merge_duplicate_rows(rows: Iterable[dict]) -> list[dict]:
             continue
 
         current = merged[key]
+        conflict_notes = []
 
-        if (
-            not current["Check In"]
-            and candidate["Check In"]
-        ):
-            current["Check In"] = candidate["Check In"]
-
-        if (
-            not current["Check Out"]
-            and candidate["Check Out"]
-        ):
-            current["Check Out"] = candidate["Check Out"]
-
-        current_confidence = confidence_rank.get(
-            current["Confidence"],
-            0,
+        current_check_in = current["Check In"]
+        candidate_check_in = (
+            candidate["Check In"]
         )
 
-        candidate_confidence = confidence_rank.get(
-            candidate["Confidence"],
-            0,
+        if (
+            not current_check_in
+            and candidate_check_in
+        ):
+            current["Check In"] = (
+                candidate_check_in
+            )
+
+        elif (
+            current_check_in
+            and candidate_check_in
+            and current_check_in
+            != candidate_check_in
+        ):
+            conflict_notes.append(
+                "Conflicting check-in values: "
+                f"{current_check_in} / "
+                f"{candidate_check_in}"
+            )
+
+        current_check_out = current["Check Out"]
+        candidate_check_out = (
+            candidate["Check Out"]
         )
 
-        if candidate_confidence > current_confidence:
-            current["Confidence"] = candidate["Confidence"]
+        if (
+            not current_check_out
+            and candidate_check_out
+        ):
+            current["Check Out"] = (
+                candidate_check_out
+            )
 
-        notes = [
+        elif (
+            current_check_out
+            and candidate_check_out
+            and current_check_out
+            != candidate_check_out
+        ):
+            conflict_notes.append(
+                "Conflicting check-out values: "
+                f"{current_check_out} / "
+                f"{candidate_check_out}"
+            )
+
+        current_confidence = (
+            confidence_rank.get(
+                current["Confidence"],
+                0,
+            )
+        )
+
+        candidate_confidence = (
+            confidence_rank.get(
+                candidate["Confidence"],
+                0,
+            )
+        )
+
+        if (
+            candidate_confidence
+            > current_confidence
+        ):
+            current["Confidence"] = (
+                candidate["Confidence"]
+            )
+
+        current["OCR Notes"] = _combine_notes(
             current["OCR Notes"],
             candidate["OCR Notes"],
-        ]
-
-        current["OCR Notes"] = "; ".join(
-            note
-            for note in dict.fromkeys(notes)
-            if note
+            *conflict_notes,
         )
 
-    return [merged[key] for key in order]
+    return [
+        merged[key]
+        for key in order
+    ]
 
+
+# ============================================================================
+# OpenAI photo extraction
+# ============================================================================
 
 def extract_attendance_rows_from_images(
     image_files: Sequence,
-    company: str,
+    group_name: str,
     scheduled_in: time,
     scheduled_out: time,
     api_key: str,
-    model: str = "gpt-5.6",
+    model: str = "gpt-5-mini",
 ) -> list[dict]:
     """
-    Extract employee names and handwritten check-in/check-out times
-    from one or more attendance photos.
-    """
+    Extract employee names and handwritten attendance times from one
+    attendance group's uploaded photos.
 
+    NOVA 1 and NOVA 2 are processed separately by the app, so each line
+    can use a different schedule and different set of photos.
+    """
     if not image_files:
         return []
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(
+        api_key=api_key
+    )
 
-    scheduled_in_text = scheduled_in.strftime("%H:%M")
-    scheduled_out_text = scheduled_out.strftime("%H:%M")
+    scheduled_in_text = (
+        scheduled_in.strftime("%H:%M")
+    )
+
+    scheduled_out_text = (
+        scheduled_out.strftime("%H:%M")
+    )
+
+    shift_crosses_midnight = (
+        scheduled_out <= scheduled_in
+    )
+
+    overnight_instruction = (
+        "This shift crosses midnight. Checkout occurs on the "
+        "calendar day after check-in."
+        if shift_crosses_midnight
+        else
+        "This shift does not cross midnight."
+    )
 
     prompt = f"""
-Read the attached completed attendance-sheet photo(s) for {company}.
+You are extracting employee attendance information from completed
+attendance-sheet photos.
 
-The scheduled shift is {scheduled_in_text} to {scheduled_out_text}.
-The shift may cross midnight.
+Attendance group: {group_name}
+Scheduled check-in: {scheduled_in_text}
+Scheduled check-out: {scheduled_out_text}
 
-Extract every employee row that is not clearly crossed out.
+{overnight_instruction}
 
-Include printed or handwritten employee names even when check-in or
-check-out is blank.
+Read every uploaded image carefully.
 
-Do not invent missing names or times.
+The attendance form may contain:
+- One table.
+- Multiple pages.
+- Two side-by-side employee tables.
+- Printed names with handwritten check-in and checkout times.
+- Blank attendance fields.
+- Crossed-out rows.
+- Repeated rows caused by overlapping photos.
 
-Return all times in 24-hour HH:MM format.
-
-Use the scheduled shift to infer AM versus PM:
-- Check-in should normally be near {scheduled_in_text}.
-- Check-out should normally be near {scheduled_out_text}.
-- For an overnight shift, checkout occurs on the following calendar day.
-
-If a handwritten time is unreadable:
-- Return an empty string for that time.
-- Explain the uncertainty in OCR Notes.
-- Do not silently guess an unreadable digit.
-
-Confidence must be exactly one of:
-high, medium, low.
+Extraction rules:
+1. Extract every real employee row that is not clearly crossed out.
+2. Do not extract headings, dates, company names, totals, signatures,
+   blank lines, or instructions as employee names.
+3. Include an employee even when check-in or checkout is blank.
+4. Read check-in only from the check-in column.
+5. Read checkout only from the checkout column.
+6. Return readable times in 24-hour HH:MM format.
+7. Use the scheduled shift to infer whether handwriting means AM or PM.
+8. Do not invent unreadable names or times.
+9. If a value cannot be read, return an empty string and explain the
+   uncertainty in OCR Notes.
+10. Confidence must be exactly high, medium, or low.
+11. Keep the original employee-name spelling visible in the photo.
 """.strip()
 
     content = [
@@ -170,11 +310,15 @@ high, medium, low.
         }
     ]
 
-    for image in image_files:
+    for image_file in image_files:
         content.append(
             {
                 "type": "input_image",
-                "image_url": _image_data_url(image),
+                "image_url": (
+                    _image_data_url(
+                        image_file
+                    )
+                ),
                 "detail": "high",
             }
         )
@@ -217,9 +361,11 @@ high, medium, low.
                     ],
                     "additionalProperties": False,
                 },
-            }
+            },
         },
-        "required": ["rows"],
+        "required": [
+            "rows",
+        ],
         "additionalProperties": False,
     }
 
@@ -234,124 +380,266 @@ high, medium, low.
         text={
             "format": {
                 "type": "json_schema",
-                "name": "attendance_photo_rows",
+                "name": (
+                    "attendance_photo_rows"
+                ),
                 "strict": True,
                 "schema": schema,
             }
         },
     )
 
-    payload = json.loads(response.output_text)
+    output_text = _clean(
+        response.output_text
+    )
+
+    if not output_text:
+        raise RuntimeError(
+            "The vision model returned no attendance data."
+        )
+
+    try:
+        payload = json.loads(
+            output_text
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "The vision model returned invalid structured data."
+        ) from exc
+
+    extracted_rows = payload.get(
+        "rows",
+        [],
+    )
 
     return merge_duplicate_rows(
-        payload.get("rows", [])
+        extracted_rows
     )
 
 
-def _parse_clock(value: str) -> time | None:
+# ============================================================================
+# Time parsing
+# ============================================================================
+
+def _clock_candidates(
+    value,
+) -> list[time]:
     """
-    Accept values including:
-    19:00
-    1900
-    7:00 PM
-    7 PM
+    Parse entered time values.
+
+    Supported examples:
+    - 19:00
+    - 1900
+    - 7:00 PM
+    - 7 PM
+    - 7:00
+
+    Ambiguous values such as 7:00 generate both 07:00 and 19:00.
+    The candidate nearest to the scheduled time is selected later.
     """
+    if value is None:
+        return []
+
+    if isinstance(value, datetime):
+        return [
+            value.time().replace(
+                second=0,
+                microsecond=0,
+            )
+        ]
+
+    if isinstance(value, time):
+        return [
+            value.replace(
+                second=0,
+                microsecond=0,
+            )
+        ]
 
     text = _clean(value)
 
     if not text:
-        return None
+        return []
 
     text = (
-        text.replace("：", ":")
+        text
+        .replace("：", ":")
         .replace("；", ":")
+        .replace(";", ":")
         .replace(".", ":")
         .upper()
     )
 
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
 
-    formats = (
-        "%H:%M",
-        "%H%M",
-        "%I:%M %p",
-        "%I:%M%p",
-        "%I %p",
-        "%I%p",
-    )
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(
-                text,
-                fmt,
-            ).time()
-        except ValueError:
-            pass
-
-    match = re.fullmatch(
-        r"(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM)?",
+    am_pm_match = re.fullmatch(
+        r"(\d{1,2})"
+        r"(?::(\d{1,2}))?"
+        r"\s*(AM|PM)",
         text,
     )
 
-    if not match:
-        return None
+    if am_pm_match:
+        hour = int(
+            am_pm_match.group(1)
+        )
 
-    hour = int(match.group(1))
-    minute = int(match.group(2) or 0)
-    am_pm = match.group(3)
+        minute = int(
+            am_pm_match.group(2)
+            or 0
+        )
 
-    if minute > 59:
-        return None
+        am_pm = am_pm_match.group(3)
 
-    if am_pm:
-        if not 1 <= hour <= 12:
-            return None
+        if (
+            hour < 1
+            or hour > 12
+            or minute > 59
+        ):
+            return []
 
         if am_pm == "AM":
-            hour = 0 if hour == 12 else hour
+            hour = (
+                0
+                if hour == 12
+                else hour
+            )
         else:
-            hour = 12 if hour == 12 else hour + 12
+            hour = (
+                12
+                if hour == 12
+                else hour + 12
+            )
 
-    elif not 0 <= hour <= 23:
+        return [
+            time(hour, minute)
+        ]
+
+    compact_match = re.fullmatch(
+        r"\d{3,4}",
+        text,
+    )
+
+    if compact_match:
+        digits = compact_match.group(0)
+        hour = int(digits[:-2])
+        minute = int(digits[-2:])
+
+    else:
+        regular_match = re.fullmatch(
+            r"(\d{1,2})"
+            r"(?::(\d{1,2}))?",
+            text,
+        )
+
+        if not regular_match:
+            return []
+
+        hour = int(
+            regular_match.group(1)
+        )
+
+        minute = int(
+            regular_match.group(2)
+            or 0
+        )
+
+    if minute > 59:
+        return []
+
+    if hour == 24 and minute == 0:
+        return [
+            time(0, 0)
+        ]
+
+    if hour < 0 or hour > 23:
+        return []
+
+    if 1 <= hour <= 11:
+        return [
+            time(hour, minute),
+            time(hour + 12, minute),
+        ]
+
+    if hour == 12:
+        return [
+            time(12, minute),
+            time(0, minute),
+        ]
+
+    return [
+        time(hour, minute)
+    ]
+
+
+def _nearest_datetime_from_text(
+    work_date: date,
+    value,
+    target: datetime,
+) -> datetime | None:
+    """
+    Choose the interpreted date/time closest to the scheduled target.
+
+    This allows:
+    - Ambiguous AM/PM entries.
+    - Overnight shifts.
+    - Checkout times after midnight.
+    """
+    clocks = _clock_candidates(
+        value
+    )
+
+    if not clocks:
         return None
 
-    return time(hour, minute)
+    candidates = []
 
+    for clock in clocks:
+        for offset in (
+            -1,
+            0,
+            1,
+            2,
+        ):
+            candidate_date = (
+                work_date
+                + timedelta(days=offset)
+            )
 
-def _nearest_datetime(
-    work_date: date,
-    clock: time,
-    target: datetime,
-) -> datetime:
-    """
-    Attach an actual clock time to the calendar date closest to the
-    scheduled time. This handles shifts that cross midnight.
-    """
-
-    candidates = [
-        datetime.combine(
-            work_date + timedelta(days=offset),
-            clock,
-        )
-        for offset in (-1, 0, 1, 2)
-    ]
+            candidates.append(
+                datetime.combine(
+                    candidate_date,
+                    clock,
+                )
+            )
 
     return min(
         candidates,
-        key=lambda candidate: abs(candidate - target),
+        key=lambda candidate: abs(
+            candidate - target
+        ),
     )
 
 
-def _minutes_text(minutes: int) -> str:
+def _minutes_text(
+    minutes: int,
+) -> str:
     if minutes == 1:
         return "1 minute"
 
     return f"{minutes} minutes"
 
 
+# ============================================================================
+# Attendance-rate calculation
+# ============================================================================
+
 def calculate_attendance_rate(
-    company: str,
+    group_name: str,
     records: Sequence[dict],
     work_date: date,
     scheduled_in: time,
@@ -359,14 +647,15 @@ def calculate_attendance_rate(
     expected_headcount: int,
 ) -> dict:
     """
-    Qualified employee requirements:
+    Calculate strict attendance.
 
-    Actual check-in <= scheduled check-in
-    Actual check-out >= scheduled check-out
+    Qualified:
+        actual check-in <= scheduled check-in
+        AND
+        actual checkout >= scheduled checkout
 
     One minute late or one minute early is an exception.
     """
-
     if expected_headcount <= 0:
         raise ValueError(
             "Expected headcount must be greater than zero."
@@ -383,13 +672,24 @@ def calculate_attendance_rate(
     )
 
     if scheduled_end <= scheduled_start:
-        scheduled_end += timedelta(days=1)
+        scheduled_end += timedelta(
+            days=1
+        )
+
+    normalized_records = (
+        merge_duplicate_rows(
+            records
+        )
+    )
 
     details: list[dict] = []
-    qualified_observed = 0
+    observed_qualified = 0
+    observed_exceptions = 0
 
-    for record in merge_duplicate_rows(records):
-        name = _clean(record.get("Name"))
+    for record in normalized_records:
+        name = _clean(
+            record.get("Name")
+        )
 
         if not name:
             continue
@@ -402,32 +702,23 @@ def calculate_attendance_rate(
             record.get("Check Out")
         )
 
-        check_in_clock = _parse_clock(
-            check_in_text
+        actual_in = (
+            _nearest_datetime_from_text(
+                work_date=work_date,
+                value=check_in_text,
+                target=scheduled_start,
+            )
         )
 
-        check_out_clock = _parse_clock(
-            check_out_text
+        actual_out = (
+            _nearest_datetime_from_text(
+                work_date=work_date,
+                value=check_out_text,
+                target=scheduled_end,
+            )
         )
 
-        actual_in = None
-        actual_out = None
-
-        if check_in_clock:
-            actual_in = _nearest_datetime(
-                work_date,
-                check_in_clock,
-                scheduled_start,
-            )
-
-        if check_out_clock:
-            actual_out = _nearest_datetime(
-                work_date,
-                check_out_clock,
-                scheduled_end,
-            )
-
-        reasons: list[str] = []
+        reasons = []
 
         if actual_in is None:
             reasons.append(
@@ -436,7 +727,7 @@ def calculate_attendance_rate(
 
         if actual_out is None:
             reasons.append(
-                "Missing or invalid check-out"
+                "Missing or invalid checkout"
             )
 
         if (
@@ -452,8 +743,10 @@ def calculate_attendance_rate(
             )
 
             reasons.append(
-                f"Late by "
-                f"{_minutes_text(late_minutes)}"
+                "Late by "
+                + _minutes_text(
+                    late_minutes
+                )
             )
 
         if (
@@ -469,29 +762,39 @@ def calculate_attendance_rate(
             )
 
             reasons.append(
-                f"Left early by "
-                f"{_minutes_text(early_minutes)}"
+                "Left early by "
+                + _minutes_text(
+                    early_minutes
+                )
             )
 
         qualified = (
             actual_in is not None
             and actual_out is not None
-            and actual_in <= scheduled_start
-            and actual_out >= scheduled_end
+            and actual_in
+            <= scheduled_start
+            and actual_out
+            >= scheduled_end
         )
 
         if qualified:
-            qualified_observed += 1
+            observed_qualified += 1
+        else:
+            observed_exceptions += 1
 
         details.append(
             {
-                "Company": company,
+                "Group": group_name,
                 "Employee": name,
                 "Scheduled In": (
-                    scheduled_in.strftime("%H:%M")
+                    scheduled_in.strftime(
+                        "%H:%M"
+                    )
                 ),
                 "Scheduled Out": (
-                    scheduled_out.strftime("%H:%M")
+                    scheduled_out.strftime(
+                        "%H:%M"
+                    )
                 ),
                 "Actual In": check_in_text,
                 "Actual Out": check_out_text,
@@ -503,27 +806,79 @@ def calculate_attendance_rate(
                 "Exception": (
                     ""
                     if qualified
-                    else "; ".join(reasons)
+                    else "; ".join(
+                        reasons
+                    )
                 ),
                 "OCR Confidence": _clean(
-                    record.get("Confidence")
+                    record.get(
+                        "Confidence"
+                    )
                 ),
                 "OCR Notes": _clean(
-                    record.get("OCR Notes")
+                    record.get(
+                        "OCR Notes"
+                    )
                 ),
             }
         )
 
-    records_found = len(details)
+    records_found = len(
+        details
+    )
 
-    # Prevent attendance rate from exceeding 100% if extra names
-    # appear in the uploaded photos.
+    missing_records = max(
+        expected_headcount
+        - records_found,
+        0,
+    )
+
+    extra_records = max(
+        records_found
+        - expected_headcount,
+        0,
+    )
+
+    # Add unnamed placeholders for expected employees who have no record.
+    for missing_index in range(
+        1,
+        missing_records + 1,
+    ):
+        details.append(
+            {
+                "Group": group_name,
+                "Employee": (
+                    "Missing scheduled employee "
+                    f"#{missing_index}"
+                ),
+                "Scheduled In": (
+                    scheduled_in.strftime(
+                        "%H:%M"
+                    )
+                ),
+                "Scheduled Out": (
+                    scheduled_out.strftime(
+                        "%H:%M"
+                    )
+                ),
+                "Actual In": "",
+                "Actual Out": "",
+                "Status": "Exception",
+                "Exception": (
+                    "No attendance record found"
+                ),
+                "OCR Confidence": "",
+                "OCR Notes": "",
+            }
+        )
+
+    # Never allow the numerator to exceed the scheduled headcount.
     qualified_for_rate = min(
-        qualified_observed,
+        observed_qualified,
         expected_headcount,
     )
 
-    exceptions = (
+    scheduled_exceptions = (
         expected_headcount
         - qualified_for_rate
     )
@@ -536,49 +891,76 @@ def calculate_attendance_rate(
 
     return {
         "summary": {
-            "Company": company,
+            "Group": group_name,
             "Scheduled Shift": (
-                f"{scheduled_in:%H:%M}"
-                f"–"
-                f"{scheduled_out:%H:%M}"
+                scheduled_in.strftime(
+                    "%H:%M"
+                )
+                + "–"
+                + scheduled_out.strftime(
+                    "%H:%M"
+                )
             ),
             "Expected": expected_headcount,
             "Records Found": records_found,
-            "Qualified": qualified_for_rate,
-            "Exceptions": exceptions,
-            "Attendance Rate": attendance_rate,
+            "Missing Records": missing_records,
+            "Extra Records": extra_records,
+            "Observed Qualified": (
+                observed_qualified
+            ),
+            "Observed Exceptions": (
+                observed_exceptions
+            ),
+            "Qualified": (
+                qualified_for_rate
+            ),
+            "Scheduled Exceptions": (
+                scheduled_exceptions
+            ),
+            "Attendance Rate": (
+                attendance_rate
+            ),
         },
         "details": details,
     }
 
+
+# ============================================================================
+# Excel export
+# ============================================================================
 
 def build_attendance_rate_workbook(
     results: dict[str, dict],
     work_date: date,
 ) -> bytes:
     """
-    Create an Excel workbook containing:
-
-    Attendance_Summary
-    NOVA_Details
-    Newstart_Details
-    HRN_Details
+    Create an Excel workbook with:
+    - Attendance_Summary
+    - One detail sheet for each calculated group
     """
+    if not results:
+        raise ValueError(
+            "No attendance results were provided."
+        )
 
-    wb = Workbook()
+    workbook = Workbook()
 
-    summary_ws = wb.active
-    summary_ws.title = "Attendance_Summary"
+    summary_ws = workbook.active
+    summary_ws.title = (
+        "Attendance_Summary"
+    )
 
-    blue = "2F75B5"
+    dark_blue = "2F75B5"
     light_blue = "BDD7EE"
-    light_fill = "F3F6FC"
-    exception_fill = "FCE4D6"
-    qualified_fill = "E2F0D9"
+    light_row = "F3F6FC"
+    alternate_row = "D9E8FA"
+    qualified_green = "E2F0D9"
+    exception_red = "FCE4D6"
+    border_color = "A6A6A6"
 
     thin = Side(
         style="thin",
-        color="A6A6A6",
+        color=border_color,
     )
 
     border = Border(
@@ -588,7 +970,27 @@ def build_attendance_rate_workbook(
         bottom=thin,
     )
 
-    summary_ws.merge_cells("A1:G1")
+    summary_headers = [
+        "Group",
+        "Scheduled Shift",
+        "Expected",
+        "Records Found",
+        "Missing Records",
+        "Extra Records",
+        "Qualified",
+        "Scheduled Exceptions",
+        "Observed Exceptions",
+        "Attendance Rate",
+    ]
+
+    summary_ws.merge_cells(
+        start_row=1,
+        start_column=1,
+        end_row=1,
+        end_column=len(
+            summary_headers
+        ),
+    )
 
     summary_ws["A1"] = (
         "End-of-Day Attendance Rate — "
@@ -597,9 +999,11 @@ def build_attendance_rate_workbook(
         f"{work_date.year}"
     )
 
-    summary_ws["A1"].fill = PatternFill(
-        "solid",
-        fgColor=blue,
+    summary_ws["A1"].fill = (
+        PatternFill(
+            "solid",
+            fgColor=dark_blue,
+        )
     )
 
     summary_ws["A1"].font = Font(
@@ -609,27 +1013,26 @@ def build_attendance_rate_workbook(
         color="FFFFFF",
     )
 
-    summary_ws["A1"].alignment = Alignment(
-        horizontal="center",
+    summary_ws["A1"].alignment = (
+        Alignment(
+            horizontal="center",
+            vertical="center",
+        )
     )
 
-    summary_headers = [
-        "Company",
-        "Scheduled Shift",
-        "Expected",
-        "Records Found",
-        "Qualified",
-        "Exceptions",
-        "Attendance Rate",
-    ]
+    summary_ws.row_dimensions[
+        1
+    ].height = 32
 
-    for col, header in enumerate(
+    header_row = 3
+
+    for column_number, header in enumerate(
         summary_headers,
         1,
     ):
         cell = summary_ws.cell(
-            3,
-            col,
+            header_row,
+            column_number,
             header,
         )
 
@@ -641,79 +1044,127 @@ def build_attendance_rate_workbook(
         cell.font = Font(
             name="Arial",
             bold=True,
+            color="1F4E79",
         )
 
         cell.alignment = Alignment(
             horizontal="center",
+            vertical="center",
+            wrap_text=True,
         )
 
         cell.border = border
 
     for row_number, result in enumerate(
         results.values(),
-        4,
+        header_row + 1,
     ):
         summary = result["summary"]
 
         values = [
-            summary["Company"],
+            summary["Group"],
             summary["Scheduled Shift"],
             summary["Expected"],
             summary["Records Found"],
+            summary["Missing Records"],
+            summary["Extra Records"],
             summary["Qualified"],
-            summary["Exceptions"],
-            summary["Attendance Rate"] / 100,
+            summary[
+                "Scheduled Exceptions"
+            ],
+            summary[
+                "Observed Exceptions"
+            ],
+            summary[
+                "Attendance Rate"
+            ]
+            / 100,
         ]
 
-        for col, value in enumerate(
+        row_fill = (
+            alternate_row
+            if row_number % 2 == 0
+            else light_row
+        )
+
+        for column_number, value in enumerate(
             values,
             1,
         ):
             cell = summary_ws.cell(
                 row_number,
-                col,
+                column_number,
                 value,
             )
 
             cell.fill = PatternFill(
                 "solid",
-                fgColor=light_fill,
+                fgColor=row_fill,
             )
 
             cell.border = border
 
+            cell.font = Font(
+                name="Arial",
+                size=11,
+            )
+
             cell.alignment = Alignment(
                 horizontal="center",
+                vertical="center",
+                wrap_text=True,
             )
 
         summary_ws.cell(
             row_number,
-            7,
+            10,
         ).number_format = "0.00%"
 
-    summary_widths = (
+    summary_widths = [
         16,
         20,
         12,
         15,
+        15,
+        14,
         12,
-        12,
+        20,
+        20,
         18,
-    )
+    ]
 
-    for col, width in enumerate(
+    for column_number, width in enumerate(
         summary_widths,
         1,
     ):
         summary_ws.column_dimensions[
-            chr(64 + col)
+            get_column_letter(
+                column_number
+            )
         ].width = width
 
     summary_ws.freeze_panes = "A4"
-    summary_ws.sheet_view.showGridLines = False
+    summary_ws.sheet_view.showGridLines = (
+        False
+    )
+
+    summary_ws.auto_filter.ref = (
+        f"A3:J"
+        f"{max(summary_ws.max_row, 3)}"
+    )
+
+    summary_ws.page_setup.orientation = (
+        "landscape"
+    )
+
+    summary_ws.page_setup.fitToWidth = 1
+    summary_ws.page_setup.fitToHeight = 0
+    summary_ws.sheet_properties.pageSetUpPr.fitToPage = (
+        True
+    )
 
     detail_headers = [
-        "Company",
+        "Group",
         "Employee",
         "Scheduled In",
         "Scheduled Out",
@@ -725,24 +1176,26 @@ def build_attendance_rate_workbook(
         "OCR Notes",
     ]
 
-    for company, result in results.items():
-        safe_company = re.sub(
+    for group_name, result in (
+        results.items()
+    ):
+        safe_group_name = re.sub(
             r"[\[\]:*?/\\]",
             "_",
-            company,
+            group_name,
         )[:20]
 
-        ws = wb.create_sheet(
-            f"{safe_company}_Details"
+        worksheet = workbook.create_sheet(
+            f"{safe_group_name}_Details"
         )
 
-        for col, header in enumerate(
+        for column_number, header in enumerate(
             detail_headers,
             1,
         ):
-            cell = ws.cell(
+            cell = worksheet.cell(
                 1,
-                col,
+                column_number,
                 header,
             )
 
@@ -754,10 +1207,13 @@ def build_attendance_rate_workbook(
             cell.font = Font(
                 name="Arial",
                 bold=True,
+                color="1F4E79",
             )
 
             cell.alignment = Alignment(
                 horizontal="center",
+                vertical="center",
+                wrap_text=True,
             )
 
             cell.border = border
@@ -766,27 +1222,42 @@ def build_attendance_rate_workbook(
             result["details"],
             2,
         ):
-            if detail["Status"] == "Qualified":
-                row_fill = qualified_fill
+            if (
+                detail["Status"]
+                == "Qualified"
+            ):
+                fill_color = (
+                    qualified_green
+                )
             else:
-                row_fill = exception_fill
+                fill_color = (
+                    exception_red
+                )
 
-            for col, header in enumerate(
+            for column_number, header in enumerate(
                 detail_headers,
                 1,
             ):
-                cell = ws.cell(
+                cell = worksheet.cell(
                     row_number,
-                    col,
-                    detail.get(header, ""),
+                    column_number,
+                    detail.get(
+                        header,
+                        "",
+                    ),
                 )
 
                 cell.fill = PatternFill(
                     "solid",
-                    fgColor=row_fill,
+                    fgColor=fill_color,
                 )
 
                 cell.border = border
+
+                cell.font = Font(
+                    name="Arial",
+                    size=11,
+                )
 
                 cell.alignment = Alignment(
                     horizontal="center",
@@ -794,35 +1265,54 @@ def build_attendance_rate_workbook(
                     wrap_text=True,
                 )
 
-        detail_widths = (
-            14,
-            26,
-            14,
-            14,
-            14,
-            14,
-            14,
-            34,
-            16,
-            34,
-        )
+            worksheet.row_dimensions[
+                row_number
+            ].height = 30
 
-        for col, width in enumerate(
+        detail_widths = [
+            14,
+            30,
+            15,
+            15,
+            15,
+            15,
+            14,
+            38,
+            18,
+            40,
+        ]
+
+        for column_number, width in enumerate(
             detail_widths,
             1,
         ):
-            ws.column_dimensions[
-                chr(64 + col)
+            worksheet.column_dimensions[
+                get_column_letter(
+                    column_number
+                )
             ].width = width
 
-        ws.freeze_panes = "A2"
-        ws.sheet_view.showGridLines = False
+        worksheet.freeze_panes = "A2"
+        worksheet.sheet_view.showGridLines = (
+            False
+        )
 
-        ws.auto_filter.ref = (
-            f"A1:J{max(ws.max_row, 1)}"
+        worksheet.auto_filter.ref = (
+            f"A1:J"
+            f"{max(worksheet.max_row, 1)}"
+        )
+
+        worksheet.page_setup.orientation = (
+            "landscape"
+        )
+
+        worksheet.page_setup.fitToWidth = 1
+        worksheet.page_setup.fitToHeight = 0
+        worksheet.sheet_properties.pageSetUpPr.fitToPage = (
+            True
         )
 
     output = BytesIO()
-    wb.save(output)
+    workbook.save(output)
 
     return output.getvalue()
