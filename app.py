@@ -264,12 +264,6 @@ st.info(
     "full scheduled shift ÷ expected scheduled employees × 100%."
 )
 
-st.warning(
-    "Strict rule: even one minute late or one minute before the "
-    "scheduled checkout time is an attendance exception. Review all "
-    "AI-extracted names and times before calculating."
-)
-
 api_key = get_openai_api_key()
 
 if api_key:
